@@ -91,24 +91,16 @@ def parse_profile_dom(page):
 
 
 def fetch_profile(page, uid):
-    captured = {}
-
-    def on_response(resp):
-        if "get_profile" in resp.url or "users/get" in resp.url:
-            try:
-                captured["data"] = resp.json()
-            except Exception:
-                pass
-
-    page.on("response", on_response)
+    data = None
     try:
-        page.goto(PROFILE_URL.format(uid=uid), wait_until="networkidle", timeout=60000)
-    except PlaywrightTimeout:
+        with page.expect_response(lambda r: "users/get_profile" in r.url, timeout=30000) as info:
+            page.goto(PROFILE_URL.format(uid=uid), wait_until="domcontentloaded", timeout=60000)
+        data = info.value.json()
+    except Exception:
         pass
-    page.remove_listener("response", on_response)
 
-    if "data" in captured:
-        name, count = parse_profile_json(captured["data"])
+    if data:
+        name, count = parse_profile_json(data)
         if count is not None:
             return name, count
     return parse_profile_dom(page)
@@ -123,6 +115,7 @@ def main():
     ap.add_argument("--cache", default="profile_cache.json", help="確認済み出品者のキャッシュ")
     ap.add_argument("--min-wait", type=float, default=3.0, help="アクセス間隔の最小秒数")
     ap.add_argument("--max-wait", type=float, default=6.0, help="アクセス間隔の最大秒数")
+    ap.add_argument("--browser", default=None, help="使う Chromium の実行ファイル（通常は指定不要）")
     ap.add_argument("--headless", action="store_true", help="ブラウザ画面を表示せずに実行")
     args = ap.parse_args()
 
@@ -130,7 +123,7 @@ def main():
     cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=args.headless)
+        browser = p.chromium.launch(headless=args.headless, executable_path=args.browser)
         page = browser.new_context(locale="ja-JP").new_page()
 
         seller_ids = collect_seller_ids(page, args.keyword, args.pages, args.min_wait, args.max_wait)
