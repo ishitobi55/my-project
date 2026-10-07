@@ -35,28 +35,20 @@ def collect_seller_ids(page, keyword, pages, min_s, max_s):
     seen = set()
     for n in range(pages):
         found = []
-
-        def on_response(resp):
-            if "entities:search" not in resp.url:
-                return
-            try:
-                data = resp.json()
-            except Exception:
-                return
+        url = SEARCH_URL.format(kw=quote(keyword), page=n)
+        print(f"[検索] {n + 1}/{pages} ページ目: {url}")
+        try:
+            # 検索 API は読み込み完了後に遅れて呼ばれることがあるので、応答そのものを待つ
+            with page.expect_response(lambda r: "entities:search" in r.url, timeout=60000) as info:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            data = info.value.json()
             for item in data.get("items", []):
                 sid = item.get("sellerId")
                 # メルカリShops の商品は通常のユーザープロフィールを持たないので除外
                 if sid and not item.get("shopName"):
                     found.append(str(sid))
-
-        page.on("response", on_response)
-        url = SEARCH_URL.format(kw=quote(keyword), page=n)
-        print(f"[検索] {n + 1}/{pages} ページ目: {url}")
-        try:
-            page.goto(url, wait_until="networkidle", timeout=60000)
-        except PlaywrightTimeout:
-            print("  読み込みがタイムアウトしました（取得できた分で続行）")
-        page.remove_listener("response", on_response)
+        except Exception as e:
+            print(f"  検索結果を取得できませんでした: {e}")
 
         new = [s for s in found if s not in seen]
         seen.update(new)
