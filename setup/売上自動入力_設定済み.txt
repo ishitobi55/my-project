@@ -1,0 +1,535 @@
+/**
+ * 売上自動入力（Claude連携用）配布版
+ *
+ * 仕入れ管理表 Ver.2.0 に追加して使うプログラムです。
+ * Claude がスクショから読み取った売上を「売上表」に書き込みます。
+ * - 同じ取引ID（メルカリの商品ID など）がすでにあれば、二重に書き込みません
+ * - 商品番号（FR013 など）から、在庫が残っている一番古いロットを選んで在庫を減らします
+ * - 配送料がスクショに出ていなければ、商品情報 R列（発送送料）から決めます
+ * - 外注さん用の在庫表（原価・利益なし）を自動で作って、1時間ごとに書き写します
+ *
+ * 最初に1回だけ：エディタで setup を実行してください（合言葉と外注さん用在庫表が作られます）。
+ * 自分に合わせて変える場所は、すぐ下の「★ 設定」だけです。
+ * 既存のスクリプト（ラクマート取込など）には触れません。
+ */
+
+// ======================= ★ 設定（自分の運用に合わせて変える） =======================
+
+// 販路ごとの配送料（封筒・シール代込み）。
+//   mini = 商品情報R列が MINI_R の商品（ゆうパケットポストmini など）
+//   post = 商品情報R列が POST_R の商品（ゆうパケットポスト など）
+// スクショに出る配送料（日本郵便の料金）から送り方を見分けるための金額も設定します。
+const SHIP_TABLE = {
+  'メルカリ': { mini: 160, post: 215 },
+  'ヤフマ':   { mini: 160, post: 210 },
+  'ヤフオク': { mini: 160, post: 210 },
+  'ラクマ':   { mini: 170, post: 180 }
+};
+const MINI_R = 160;              // 商品情報R列がこの金額なら mini
+const POST_R = 215;              // 商品情報R列がこの金額なら post
+const SHOWN_MINI = [160, 170];   // スクショの配送料がこれなら mini
+const SHOWN_POST = [215, 210];   // スクショの配送料がこれなら post
+
+// メルカリShops など、送り方に関係なく配送料が決まっている販路（販路名に「shops」を含むもの）
+const SHOPS_SHIP = 210;
+
+// セット・ミックス商品のルール（使わなければ空のままでOK）
+//   売れたときにセットの在庫が無ければ、parts の商品を1個ずつ使ってセットを作ってから記録します。
+//   parts: 中身の商品番号 / out: できあがる数 / name: 商品名 / price: 販売価格
+//   例）白1セット＋黒1セット → 白黒ミックス2セット：
+//     'S009': { parts: ['S007', 'S008'], out: 2, name: 'グリップテープ白黒' },
+//   例）違う商品の2点セット：
+//     'FR045': { parts: ['FR001', 'FR003'], out: 1, name: '2点セット', price: 1790 },
+const MIX_RULES = {
+};
+
+const LOW_STOCK = 2;   // 外注さん用在庫表で「残りわずか」と表示する在庫数
+
+// ===================================================================================
+
+const URIAGE_SHEET = '売上表';
+const SHOHIN_SHEET = '商品情報';
+
+// 売上表の列（1始まり）
+const U_TORIHIKI = 2;  // B 取引ID
+const U_KANRI = 3;     // C 商品管理番号
+const U_DATE = 4;      // D 日付
+const U_ROUTE = 5;     // E 販売経路
+const U_SALES = 6;     // F 売上
+const U_SHIP = 8;      // H 配送料
+
+// 商品情報の列（1始まり）
+const S_NUM = 2;       // B 商品番号
+const S_ORDER = 3;     // C 発注日
+const S_KANRI = 4;     // D 商品管理番号
+const S_NAME = 6;      // F 商品名
+const S_SHIP = 18;     // R 発送送料
+const S_STOCK = 19;    // S 在庫数
+
+/** 販路の名前は、設定シートの「販路別 手数料率」の表から読む（手数料が正しく計算される名前だけを受け付ける） */
+function routes_() {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('設定');
+  const fallback = ['メルカリ', 'ヤフオク', 'ヤフマ', 'ラクマ', 'その他'];
+  if (!sh) return fallback;
+  const v = sh.getRange(1, 1, sh.getLastRow(), 2).getValues();
+  const start = v.findIndex(r => String(r[0]).trim() === '販路' && String(r[1]).trim() === '手数料率');
+  if (start < 0) return fallback;
+  const out = [];
+  for (let i = start + 1; i < v.length; i++) {
+    const name = String(v[i][0]).trim();
+    if (!name || name.indexOf('■') === 0) break;
+    out.push(name);
+  }
+  return out.length ? out : fallback;
+}
+
+function isShops_(route) {
+  return /shops/i.test(route);
+}
+
+/**
+ * 配送料を決める。
+ * スクショに配送料が出ていればそこから送り方を判断し、出ていなければ商品情報R列から判断する。
+ * 送り方がわからない金額は、そのまま使う。
+ */
+function shipFee_(route, rShip, shownShip) {
+  if (isShops_(route) && SHOPS_SHIP) return { fee: SHOPS_SHIP, from: 'Shops固定' };
+  const t = SHIP_TABLE[route];
+  const shown = (shownShip === null || shownShip === undefined || shownShip === '') ? null : Number(shownShip);
+  let method = null;
+  if (shown !== null) {
+    if (SHOWN_MINI.indexOf(shown) >= 0) method = 'mini';
+    else if (SHOWN_POST.indexOf(shown) >= 0) method = 'post';
+  } else {
+    if (rShip === MINI_R) method = 'mini';
+    else if (rShip === POST_R) method = 'post';
+  }
+  if (t && method) return { fee: t[method], from: (shown !== null ? 'スクショ' : 'R列') + '→' + (method === 'mini' ? 'ポストmini' : 'ポスト') };
+  return shown !== null ? { fee: shown, from: 'スクショ(そのまま)' } : { fee: rShip, from: 'R列(そのまま)' };
+}
+
+/**
+ * 受け取る形:
+ * { token, dryRun?: true,
+ *   rows: [{ 取引ID, 商品番号, 日付: '2026/10/01', 販路: 'メルカリ', 売上: 1280, 配送料: null }] }
+ * まとめ売りは同じ取引IDの行を複数送る。
+ *
+ * 商品登録は action: 'addProducts' で
+ * { token, action: 'addProducts', dryRun?: true,
+ *   items: [{ 商品番号, 発注日: '2026/09/10', 商品名, 注文数, 商品代: 256.03 }] }
+ */
+function doPost(e) {
+  let req;
+  try {
+    req = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return json_({ ok: false, error: 'JSONが読めません' });
+  }
+  const token = PropertiesService.getScriptProperties().getProperty('URIAGE_TOKEN');
+  if (!token || req.token !== token) return json_({ ok: false, error: 'token' });
+
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    if (req.action === 'syncShare') {
+      return json_({ ok: true, results: syncGaichuZaiko() });
+    }
+    let results;
+    if (req.action === 'repack') {
+      results = repack_(req, !!req.dryRun);
+    } else if (req.action === 'addProducts') {
+      results = addProducts_(req.items || [], !!req.dryRun);
+    } else {
+      results = addSales_(req.rows || [], !!req.dryRun);
+    }
+    if (!req.dryRun) {
+      try { syncGaichuZaiko(); } catch (err) { /* 在庫表の更新に失敗しても書き込み結果は返す */ }
+    }
+    return json_({ ok: true, dryRun: !!req.dryRun, results });
+  } catch (err) {
+    return json_({ ok: false, error: String(err) });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function addSales_(rows, dryRun) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const uSheet = ss.getSheetByName(URIAGE_SHEET);
+  const sSheet = ss.getSheetByName(SHOHIN_SHEET);
+
+  const existing = new Set(
+    uSheet.getRange(2, U_TORIHIKI, Math.max(uSheet.getLastRow() - 1, 1), 1).getValues()
+      .map(r => String(r[0]).trim()).filter(String)
+  );
+
+  // 取引IDごとにまとめる（まとめ売り対応）
+  const groups = {};
+  rows.forEach(r => {
+    const id = String(r['取引ID'] || '').trim();
+    (groups[id] = groups[id] || []).push(r);
+  });
+
+  const ROUTES = routes_();
+  const results = [];
+  const autoMixed = [];
+  // dryRun のときは書き込まないので、同じ商品の在庫の減り方をここで数える
+  const usedInBatch = {};
+
+  Object.keys(groups).forEach(id => {
+    if (!id) {
+      groups[id].forEach(r => results.push({ 取引ID: id, 商品番号: r['商品番号'], status: 'error', error: '取引IDが空' }));
+      return;
+    }
+    if (existing.has(id)) {
+      groups[id].forEach(r => results.push({ 取引ID: id, 商品番号: r['商品番号'], status: 'skip', error: '登録済み' }));
+      return;
+    }
+
+    // 先に全行を検証し、1行でもダメなら取引ごと書かない
+    const plans = [];
+    let bad = null;
+    groups[id].forEach(r => {
+      const num = String(r['商品番号'] || '').trim().toUpperCase();
+      const route = String(r['販路'] || '').trim();
+      if (ROUTES.indexOf(route) < 0) { bad = bad || `販路「${route}」が不明`; return; }
+      let lot = pickLot_(sSheet, num, usedInBatch);
+      // ミックス商品の在庫が無ければ、白・黒から自動で組み替えてから売る
+      if (!lot && MIX_RULES[num] && !dryRun) {
+        const mixed = autoMix_(num);
+        if (mixed) {
+          autoMixed.push(mixed);
+          lot = pickLot_(sSheet, num, usedInBatch);
+        }
+      }
+      if (!lot) { bad = bad || `${num} の在庫がある行が商品情報にありません`; return; }
+      const stockBefore = lot.stock - (usedInBatch[lot.kanri] || 0);
+      usedInBatch[lot.kanri] = (usedInBatch[lot.kanri] || 0) + 1;
+      const s = shipFee_(route, lot.ship, r['配送料']);
+      plans.push({ r, num, route, lot, ship: s.fee, shipFrom: s.from, stockBefore });
+    });
+    if (bad) {
+      groups[id].forEach(r => results.push({ 取引ID: id, 商品番号: r['商品番号'], status: 'error', error: bad }));
+      // 在庫の仮押さえを戻す
+      plans.forEach(p => usedInBatch[p.lot.kanri]--);
+      return;
+    }
+
+    // まとめ売り（同じ取引IDが複数行）は荷物1個ぶんの配送料を行数で割る。端数は1行目に寄せる
+    if (plans.length > 1) {
+      const total = Math.max.apply(null, plans.map(p => p.ship));
+      const each = Math.floor(total / plans.length);
+      plans.forEach((p, i) => {
+        p.ship = i === 0 ? total - each * (plans.length - 1) : each;
+        p.shipFrom += '(まとめ売りで分割)';
+      });
+    }
+
+    plans.forEach(p => {
+      const out = {
+        取引ID: id, 商品番号: p.num, 商品管理番号: p.lot.kanri, 商品名: p.lot.name,
+        日付: p.r['日付'], 販路: p.route, 売上: Number(p.r['売上']), 配送料: p.ship,
+        配送料の出どころ: p.shipFrom,
+        在庫_書込前: p.stockBefore,
+        status: dryRun ? 'preview' : 'added'
+      };
+      if (!dryRun) {
+        const row = nextEmptyRow_(uSheet);
+        uSheet.getRange(row, U_TORIHIKI, 1, 5).setValues([[id, p.lot.kanri, new Date(p.r['日付']), p.route, Number(p.r['売上'])]]);
+        uSheet.getRange(row, U_SHIP).setValue(p.ship);
+        SpreadsheetApp.flush();
+        out.行 = row;
+      }
+      results.push(out);
+    });
+    if (!dryRun) Object.keys(usedInBatch).forEach(k => usedInBatch[k] = 0); // 書き込んだ分は在庫数に反映済み
+    existing.add(id);
+  });
+  autoMixed.forEach(m => results.push(m));
+  return results;
+}
+
+/** ミックス商品の在庫が切れたとき、古い発注日のロットから順に組み替えを試す */
+function autoMix_(num) {
+  const rule = MIX_RULES[num];
+  const parts = rule.parts;
+  const sSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHOHIN_SHEET);
+  const v = sSheet.getRange(2, 1, sSheet.getLastRow() - 1, S_STOCK).getValues();
+  const dates = {};
+  v.forEach(r => {
+    const n = String(r[S_NUM - 1]).trim().toUpperCase();
+    if (parts.indexOf(n) >= 0 && (Number(r[S_STOCK - 1]) || 0) >= 1) {
+      const t = new Date(r[S_ORDER - 1]);
+      const key = Utilities.formatDate(t, Session.getScriptTimeZone(), 'yyyy/MM/dd');
+      (dates[key] = dates[key] || new Set()).add(n);
+    }
+  });
+  const candidates = Object.keys(dates).filter(k => dates[k].size === parts.length).sort();
+  for (const d of candidates) {
+    const req = { '発注日': d, from: parts.map(p => ({ '商品番号': p, '数': 1 })), to: { '商品番号': num, '数': rule.out, '商品名': rule.name, '販売価格': rule.price } };
+    const preview = repack_(req, true)[0];
+    if (preview.status === 'preview') {
+      const done = repack_(req, false)[0];
+      return { 商品番号: num, status: 'auto-mix', 内容: '在庫が無かったので自動で組み替え（' + d + '分）', 組み替え元: done.組み替え元, 組み替え先: done.組み替え先 };
+    }
+  }
+  return null;
+}
+
+// 商品情報の入力列（1始まり）
+const S_QTY = 11;      // K 注文数
+const S_PRICE = 12;    // L 販売価格
+const S_COST = 16;     // P 商品代(元/個)
+const S_CNSHIP = 17;   // Q 中国国内送料(元)
+
+/**
+ * 商品情報に仕入れた商品を登録する。
+ * - 同じ商品管理番号（商品番号-発注日）がすでにあれば登録しない
+ * - リピート品は、前回のロットの商品名・販売価格・発送送料を引き継ぐ
+ * - 新しい商品は、販売価格と発送送料を空欄のままにする
+ */
+function addProducts_(items, dryRun) {
+  const sSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHOHIN_SHEET);
+  const last = Math.max(sSheet.getLastRow(), 2);
+  const v = sSheet.getRange(2, 1, last - 1, S_SHIP).getValues();
+
+  const kanriSet = new Set(v.map(r => String(r[S_KANRI - 1]).trim()).filter(String));
+  // 商品番号ごとに一番新しいロット（前回の値を引き継ぐ元）
+  const latest = {};
+  v.forEach(r => {
+    const num = String(r[S_NUM - 1]).trim().toUpperCase();
+    if (!num) return;
+    const t = new Date(r[S_ORDER - 1]).getTime() || 0;
+    if (!latest[num] || t >= latest[num].t) {
+      latest[num] = { t, name: r[S_NAME - 1], price: r[S_PRICE - 1], ship: r[S_SHIP - 1] };
+    }
+  });
+
+  // 商品番号（B列）が空の最初の行から書く
+  let row = 2;
+  for (let i = v.length - 1; i >= 0; i--) {
+    if (String(v[i][S_NUM - 1]).trim()) { row = i + 3; break; }
+  }
+
+  const results = [];
+  items.forEach(it => {
+    const num = String(it['商品番号'] || '').trim().toUpperCase();
+    const order = new Date(it['発注日']);
+    const ymd = Utilities.formatDate(order, Session.getScriptTimeZone(), 'yyyyMMdd');
+    const kanri = num + '-' + ymd;
+    if (!num || isNaN(order.getTime())) {
+      results.push({ 商品番号: num, status: 'error', error: '商品番号か発注日が空' });
+      return;
+    }
+    if (kanriSet.has(kanri)) {
+      results.push({ 商品番号: num, 商品管理番号: kanri, status: 'skip', error: '登録済み' });
+      return;
+    }
+    const prev = latest[num];
+    const name = prev ? prev.name : String(it['商品名'] || '').replace(/[①-⑳]/g, '').trim();
+    const out = {
+      商品番号: num, 商品管理番号: kanri, 商品名: name, 注文数: Number(it['注文数']),
+      商品代: Number(it['商品代']), 販売価格: prev ? prev.price : (it['販売価格'] || ''), 発送送料: prev ? prev.ship : (it['発送送料'] || ''),
+      リピート: !!prev, status: dryRun ? 'preview' : 'added'
+    };
+    if (!dryRun) {
+      sSheet.getRange(row, S_NUM, 1, 2).setValues([[num, order]]);
+      const dCell = sSheet.getRange(row, S_KANRI);
+      if (!dCell.getFormula() && !String(dCell.getValue()).trim()) dCell.setValue(kanri);
+      sSheet.getRange(row, S_NAME).setValue(name);
+      sSheet.getRange(row, S_QTY, 1, 2).setValues([[out.注文数, out.販売価格]]);
+      sSheet.getRange(row, S_COST, 1, 3).setValues([[out.商品代, 0, out.発送送料]]);
+      out.行 = row;
+      row++;
+    }
+    kanriSet.add(kanri);
+    results.push(out);
+  });
+  if (!dryRun) SpreadsheetApp.flush();
+  return results;
+}
+
+/**
+ * 組み替え（例：白1セット＋黒1セット → 白黒ミックス2セット）を注文数の付け替えで記録する。
+ * { action: 'repack', 発注日: '2026/09/10', from: [{商品番号:'S007',数:1},{商品番号:'S008',数:1}], to: {商品番号:'S009',数:2} }
+ * 同じ発注日のロットどうしで付け替える。原価の合計が変わらないので検算はずれない。
+ * 組み替え先のロットが無ければ、元の商品の原価の平均で作る。
+ */
+function repack_(req, dryRun) {
+  const sSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHOHIN_SHEET);
+  const last = sSheet.getLastRow();
+  const v = sSheet.getRange(2, 1, last - 1, S_STOCK).getValues();
+  const order = new Date(req['発注日']);
+  const ymd = Utilities.formatDate(order, Session.getScriptTimeZone(), 'yyyyMMdd');
+  const findRow = num => {
+    const kanri = String(num).trim().toUpperCase() + '-' + ymd;
+    for (let i = 0; i < v.length; i++) {
+      if (String(v[i][S_KANRI - 1]).trim() === kanri) return { row: i + 2, kanri, qty: Number(v[i][S_QTY - 1]) || 0, cost: Number(v[i][S_COST - 1]) || 0, stock: Number(v[i][S_STOCK - 1]) || 0, ship: Number(v[i][S_SHIP - 1]) || 0 };
+    }
+    return null;
+  };
+
+  const froms = (req.from || []).map(f => ({ num: String(f['商品番号']).trim().toUpperCase(), n: Number(f['数']), lot: findRow(f['商品番号']) }));
+  const bad = froms.find(f => !f.lot || !(f.n > 0) || f.lot.stock < f.n);
+  if (bad) {
+    return [{ status: 'error', error: bad.lot ? bad.num + ' の在庫が足りません（在庫' + bad.lot.stock + '）' : bad.num + '-' + ymd + ' が商品情報にありません' }];
+  }
+  const toNum = String(req.to['商品番号']).trim().toUpperCase();
+  const toN = Number(req.to['数']);
+  const costSum = froms.reduce((s, f) => s + f.lot.cost * f.n, 0);
+  let toLot = findRow(toNum);
+  const out = { 組み替え元: froms.map(f => f.lot.kanri + ' 注文数 ' + f.lot.qty + '→' + (f.lot.qty - f.n)), 組み替え先: '', 原価の差: 0, status: dryRun ? 'preview' : 'done' };
+
+  if (toLot) {
+    out.組み替え先 = toLot.kanri + ' 注文数 ' + toLot.qty + '→' + (toLot.qty + toN);
+    out.原価の差 = Math.round((toLot.cost * toN - costSum) * 100) / 100; // 0 でなければ検算がずれる
+  } else {
+    out.組み替え先 = toNum + '-' + ymd + ' を新しく作成 注文数 ' + toN + '、原価 ' + Math.round(costSum / toN * 100) / 100;
+  }
+  if (out.原価の差 !== 0) {
+    out.status = 'error';
+    out.error = '組み替え先の原価が元の商品と合わないので、検算がずれます';
+    return [out];
+  }
+  if (dryRun) return [out];
+
+  froms.forEach(f => sSheet.getRange(f.lot.row, S_QTY).setValue(f.lot.qty - f.n));
+  if (toLot) {
+    sSheet.getRange(toLot.row, S_QTY).setValue(toLot.qty + toN);
+  } else {
+    addProducts_([{ 商品番号: toNum, 発注日: req['発注日'], 商品名: req.to['商品名'] || '', 注文数: toN, 商品代: Math.round(costSum / toN * 100) / 100,
+      発送送料: Math.max.apply(null, froms.map(f => f.lot.ship)), 販売価格: req.to['販売価格'] || '' }], false);
+  }
+  SpreadsheetApp.flush();
+  return [out];
+}
+
+/** 商品番号から、在庫が残っている一番古い発注日のロットを返す */
+function pickLot_(sSheet, num, usedInBatch) {
+  const last = sSheet.getLastRow();
+  if (last < 2) return null;
+  const v = sSheet.getRange(2, 1, last - 1, S_STOCK).getValues();
+  const lots = v
+    .filter(r => String(r[S_NUM - 1]).trim().toUpperCase() === num && String(r[S_KANRI - 1]).trim())
+    .map(r => ({
+      kanri: String(r[S_KANRI - 1]).trim(),
+      order: new Date(r[S_ORDER - 1]).getTime() || 0,
+      name: r[S_NAME - 1],
+      ship: Number(r[S_SHIP - 1]) || 0,
+      stock: Number(r[S_STOCK - 1]) || 0
+    }))
+    .filter(l => l.stock - (usedInBatch[l.kanri] || 0) > 0)
+    .sort((a, b) => a.order - b.order);
+  return lots[0] || null;
+}
+
+/** 売上表で商品管理番号（C列）が空の最初の行 */
+function nextEmptyRow_(uSheet) {
+  const last = Math.max(uSheet.getLastRow(), 2);
+  const c = uSheet.getRange(2, U_KANRI, last - 1, 1).getValues();
+  for (let i = c.length - 1; i >= 0; i--) {
+    if (String(c[i][0]).trim()) return i + 3;
+  }
+  return 2;
+}
+
+// ===== 外注さん用在庫表 =====
+// 原価・利益は書き写さない。数字（値）だけを書くので、この管理表への手がかりは残らない。
+const SHARE_TAB = '在庫';
+const S_COLOR = 7;     // G 色・サイズ
+const S_IMAGE = 14;    // N 画像リンク
+
+/** 商品番号ごとに在庫を合計して、外注さん用在庫表に書き写す */
+function syncGaichuZaiko() {
+  const SHARE_SHEET_ID = PropertiesService.getScriptProperties().getProperty('SHARE_SHEET_ID');
+  if (!SHARE_SHEET_ID) return { 商品数: 0, 更新: '外注さん用在庫表が未設定（setup を実行してください）' };
+  const sSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHOHIN_SHEET);
+  const last = sSheet.getLastRow();
+  const v = last < 2 ? [] : sSheet.getRange(2, 1, last - 1, S_STOCK).getValues();
+
+  const byNum = {};
+  v.forEach(r => {
+    const num = String(r[S_NUM - 1]).trim().toUpperCase();
+    if (!num) return;
+    const t = new Date(r[S_ORDER - 1]).getTime() || 0;
+    const g = byNum[num] || (byNum[num] = { stock: 0, t: -1 });
+    g.stock += Number(r[S_STOCK - 1]) || 0;
+    if (t >= g.t) { // 名前・色・画像は一番新しいロットのものを使う
+      g.t = t;
+      g.name = r[S_NAME - 1];
+      g.color = r[S_COLOR - 1];
+      g.image = String(r[S_IMAGE - 1] || '').trim();
+    }
+  });
+
+  const rows = Object.keys(byNum)
+    .filter(n => byNum[n].stock > 0)
+    .sort()
+    .map(n => {
+      const g = byNum[n];
+      const img = /^https?:\/\//.test(g.image) ? '=IMAGE("' + g.image.replace(/"/g, '') + '")' : '';
+      return [img, n, g.name, g.color, g.stock, g.stock <= LOW_STOCK ? '残りわずか' : ''];
+    });
+  const lowCount = rows.filter(r => r[5]).length;
+
+  const ss = SpreadsheetApp.openById(SHARE_SHEET_ID);
+  const sh = ss.getSheetByName(SHARE_TAB) || ss.insertSheet(SHARE_TAB, 0);
+  sh.clear();
+  const now = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy/MM/dd HH:mm');
+  sh.getRange(1, 1, 1, 6).setValues([['在庫一覧（' + now + ' 更新）', '', '', '残りわずか（' + LOW_STOCK + '個以下）: ' + lowCount + '件', '', '']]);
+  sh.getRange(2, 1, 1, 6).setValues([['画像', '商品番号', '商品名', '色・サイズ', '在庫数', '状態']]).setFontWeight('bold').setBackground('#eeeeee');
+  if (rows.length) {
+    sh.getRange(3, 1, rows.length, 6).setValues(rows);
+    // 残りわずかの行は薄い赤で塗る
+    sh.getRange(3, 1, rows.length, 6).setBackgrounds(rows.map(r => Array(6).fill(r[5] ? '#fde2e1' : null)));
+    sh.getRange(3, 6, rows.length, 1).setFontColor('#c62828').setFontWeight('bold');
+  }
+  sh.setFrozenRows(2);
+  sh.setColumnWidth(1, 70);
+  sh.setColumnWidth(3, 220);
+  if (rows.length) sh.setRowHeights(3, rows.length, 60);
+  // 最初に入っている空の「シート1」は消す
+  const blank = ss.getSheetByName('シート1');
+  if (blank && ss.getSheets().length > 1) ss.deleteSheet(blank);
+  return { 商品数: rows.length, 更新: now };
+}
+
+/**
+ * 最初に1回だけ実行する。
+ * - Claude が書き込むときに使う「合言葉」を作る
+ * - 外注さん用の在庫表（別のスプレッドシート）を作る
+ * - 1時間ごとに在庫表を更新するしかけを作る
+ * 何度実行しても、合言葉と在庫表は作り直しません。
+ */
+function setup() {
+  const props = PropertiesService.getScriptProperties();
+  if (!props.getProperty('URIAGE_TOKEN')) {
+    props.setProperty('URIAGE_TOKEN', Utilities.getUuid().replace(/-/g, ''));
+  }
+  let shareId = props.getProperty('SHARE_SHEET_ID');
+  if (shareId) {
+    try { SpreadsheetApp.openById(shareId); } catch (err) { shareId = null; }
+  }
+  if (!shareId) {
+    const name = SpreadsheetApp.getActiveSpreadsheet().getName() + '（外注さん用在庫表）';
+    shareId = SpreadsheetApp.create(name).getId();
+    props.setProperty('SHARE_SHEET_ID', shareId);
+  }
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'syncGaichuZaiko')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('syncGaichuZaiko').timeBased().everyHours(1).create();
+  const r = syncGaichuZaiko();
+  console.log('準備OK。外注さん用在庫表: https://docs.google.com/spreadsheets/d/' + shareId + '（' + r.商品数 + '商品）');
+  console.log('販路として受け付ける名前: ' + routes_().join('、'));
+  showToken();
+}
+
+/** Claude に教える合言葉を表示する（自分の Claude にだけ伝える。ほかの人には見せない） */
+function showToken() {
+  console.log('合言葉: ' + PropertiesService.getScriptProperties().getProperty('URIAGE_TOKEN'));
+}
+
+function json_(o) {
+  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+}
